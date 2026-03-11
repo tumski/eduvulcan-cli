@@ -1,0 +1,7 @@
+#!/usr/bin/env bash
+set -euo pipefail
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+if [[ "${1-}" == "help" || "${1-}" == "--help" || "${1-}" == "-h" ]]; then
+  exec node "$SCRIPT_DIR/../dist/cli.js" help
+fi
+exec node "$SCRIPT_DIR/../dist/cli.js" fetch "$@"
