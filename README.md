@@ -6,6 +6,7 @@ Why this exists:
 - browser automation is used only for login/session establishment
 - data fetching happens via API calls after login
 - output is normalized JSON suitable for cron, storage, and downstream agents
+- the CLI itself does not use any LLM; it only fetches and stores data
 
 ## Requirements
 
@@ -108,7 +109,7 @@ A retrying wrapper is included:
 ./scripts/fetch-with-retries.sh
 ```
 
-It writes logs to `./logs/YYYY-MM-DD-fetch.log`, stores snapshots in `./data/`, and retries with backoff.
+It writes logs to `./logs/YYYY-MM-DD-fetch.log`, stores snapshots in `./data/`, retries with backoff, and explicitly runs the standalone standard day fetch (`--date today --profile standard`).
 
 If you want a classic system cron entry on a machine that allows `crontab`, run:
 

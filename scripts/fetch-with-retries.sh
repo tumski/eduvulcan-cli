@@ -32,7 +32,7 @@ for delay in "${attempt_delays[@]}"; do
 
   echo "[$(timestamp)] Attempt ${attempt} starting." >> "$LOG_FILE"
   set +e
-  "$ROOT_DIR/bin/eduvulcan-fetch" --output-dir "$DATA_DIR" --debug-dir "$LOG_DIR" >> "$LOG_FILE" 2>&1
+  "$ROOT_DIR/bin/eduvulcan-fetch" --date today --profile standard --output-dir "$DATA_DIR" --debug-dir "$LOG_DIR" >> "$LOG_FILE" 2>&1
   status=$?
   set -e
 
