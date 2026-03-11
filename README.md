@@ -80,6 +80,22 @@ If `--output-dir` is used, the CLI writes:
 
 Writes are atomic.
 
+## Cron-friendly wrapper
+
+A retrying wrapper is included:
+
+```bash
+./scripts/fetch-with-retries.sh
+```
+
+It writes logs to `./logs/YYYY-MM-DD-fetch.log`, stores snapshots in `./data/`, and retries with backoff.
+
+If you want a classic system cron entry on a machine that allows `crontab`, run:
+
+```bash
+./scripts/install-cron.sh
+```
+
 ## Exit codes
 
 - `0` success
