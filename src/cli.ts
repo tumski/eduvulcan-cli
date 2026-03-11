@@ -3,7 +3,7 @@ import { resolve } from 'node:path';
 import { getRuntimeConfig, loadEnvironment } from './config.js';
 import { fetchSnapshot } from './fetch.js';
 import { writeJsonAtomic } from './storage.js';
-import { CliError, EXIT_CODES } from './types.js';
+import { CliError, EXIT_CODES, type FetchProfile } from './types.js';
 
 interface ParsedArgs {
   command: 'fetch' | 'help';
@@ -11,6 +11,9 @@ interface ParsedArgs {
   outputDir?: string;
   debugDir?: string;
   headlessOverride?: boolean;
+  date?: string;
+  timezone?: string;
+  profile: FetchProfile;
 }
 
 function usage(): string {
@@ -18,13 +21,14 @@ function usage(): string {
     'eduvulcan-fetch',
     '',
     'Usage:',
-    '  eduvulcan-fetch [fetch] [--output <path>] [--output-dir <dir>] [--debug-dir <dir>] [--headless|--headed]',
+    '  eduvulcan-fetch [fetch] [--date today|tomorrow|YYYY-MM-DD] [--profile standard|comprehensive] [--timezone Europe/Warsaw] [--output <path>] [--output-dir <dir>] [--debug-dir <dir>] [--headless|--headed]',
     '  eduvulcan-fetch help',
     '',
     'Examples:',
     '  eduvulcan-fetch',
+    '  eduvulcan-fetch --date tomorrow',
+    '  eduvulcan-fetch --date 2026-03-13 --profile comprehensive',
     '  eduvulcan-fetch --output-dir ./data --debug-dir ./logs',
-    '  eduvulcan-fetch --output ./data/2026-03-11.json',
   ].join('\n');
 }
 
@@ -36,7 +40,7 @@ function parseArgs(argv: string[]): ParsedArgs {
     throw new CliError(`Unknown command: ${maybeCommand}\n\n${usage()}`, EXIT_CODES.UNEXPECTED);
   }
 
-  const parsed: ParsedArgs = { command };
+  const parsed: ParsedArgs = { command, profile: 'standard' };
 
   for (let index = 0; index < rest.length; index += 1) {
     const arg = rest[index];
@@ -56,6 +60,23 @@ function parseArgs(argv: string[]): ParsedArgs {
       case '--debug-dir':
         if (!next) throw new CliError('--debug-dir requires a directory value', EXIT_CODES.UNEXPECTED);
         parsed.debugDir = next;
+        index += 1;
+        break;
+      case '--date':
+        if (!next) throw new CliError('--date requires a value', EXIT_CODES.UNEXPECTED);
+        parsed.date = next;
+        index += 1;
+        break;
+      case '--timezone':
+        if (!next) throw new CliError('--timezone requires a value', EXIT_CODES.UNEXPECTED);
+        parsed.timezone = next;
+        index += 1;
+        break;
+      case '--profile':
+        if (!next || (next !== 'standard' && next !== 'comprehensive')) {
+          throw new CliError('--profile requires standard or comprehensive', EXIT_CODES.UNEXPECTED);
+        }
+        parsed.profile = next;
         index += 1;
         break;
       case '--headless':
@@ -85,13 +106,16 @@ async function runFetch(args: ParsedArgs): Promise<void> {
     password: config.password,
     headless,
     debugDir: args.debugDir ? resolve(args.debugDir) : undefined,
+    targetDate: args.date,
+    timezone: args.timezone,
+    profile: args.profile,
   });
 
   if (args.outputDir) {
     const outputDir = resolve(args.outputDir);
-    const dateStamp = snapshot.fetchedAt.slice(0, 10);
-    await writeJsonAtomic(resolve(outputDir, `${dateStamp}.json`), snapshot);
-    await writeJsonAtomic(resolve(outputDir, 'latest.json'), snapshot);
+    const suffix = args.profile === 'comprehensive' ? '.comprehensive' : '';
+    await writeJsonAtomic(resolve(outputDir, `${snapshot.targetDate}${suffix}.json`), snapshot);
+    await writeJsonAtomic(resolve(outputDir, `latest${suffix}.json`), snapshot);
   }
 
   if (args.output) {

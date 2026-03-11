@@ -10,6 +10,8 @@ import type {
   EduMessageDetail,
   EduMessageListItem,
   EduScheduleItem,
+  FetchProfile,
+  NormalizedFreeDayItem,
   NormalizedGradeItem,
   NormalizedHomeworkItem,
   NormalizedMessageItem,
@@ -21,7 +23,8 @@ import type {
 import { CliError, EXIT_CODES } from './types.js';
 
 const LOGIN_URL = 'https://eduvulcan.pl/logowanie';
-const VERSION = '0.1.0';
+const VERSION = '0.2.0';
+const DEFAULT_TIMEZONE = process.env.TZ || 'Europe/Warsaw';
 
 const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
 
@@ -76,6 +79,15 @@ function normalizeGrades(rawItems: EduGradeItem[]): NormalizedGradeItem[] {
   }));
 }
 
+function normalizeFreeDays(rawItems: Record<string, unknown>[]): NormalizedFreeDayItem[] {
+  return rawItems.map((item) => ({
+    date: typeof item.data === 'string' ? item.data : typeof item.date === 'string' ? item.date : null,
+    title: typeof item.nazwa === 'string' ? item.nazwa : typeof item.tytul === 'string' ? item.tytul : null,
+    description: typeof item.opis === 'string' ? item.opis : null,
+    raw: item,
+  }));
+}
+
 function mapMessageToStudent(studentName: string, allMessages: EduMessageListItem[]): EduMessageListItem[] {
   const tokens = studentName
     .toLowerCase()
@@ -93,12 +105,77 @@ function mapMessageToStudent(studentName: string, allMessages: EduMessageListIte
     .slice(0, 10);
 }
 
+function resolveTargetDate(input: string | undefined, timezone: string): string {
+  if (!input || input === 'today') {
+    return new Intl.DateTimeFormat('en-CA', {
+      timeZone: timezone,
+      year: 'numeric',
+      month: '2-digit',
+      day: '2-digit',
+    }).format(new Date());
+  }
+
+  if (input === 'tomorrow') {
+    const now = new Date();
+    const tomorrow = new Date(now.getTime() + 24 * 60 * 60 * 1000);
+    return new Intl.DateTimeFormat('en-CA', {
+      timeZone: timezone,
+      year: 'numeric',
+      month: '2-digit',
+      day: '2-digit',
+    }).format(tomorrow);
+  }
+
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(input)) {
+    throw new CliError(`Invalid --date value: ${input}. Use today, tomorrow, or YYYY-MM-DD.`, EXIT_CODES.UNEXPECTED);
+  }
+
+  return input;
+}
+
+function getOffsetForDate(date: string, timezone: string): string {
+  const formatter = new Intl.DateTimeFormat('en-US', {
+    timeZone: timezone,
+    timeZoneName: 'longOffset',
+    hour: '2-digit',
+    minute: '2-digit',
+    hour12: false,
+  });
+  const probe = new Date(`${date}T12:00:00.000Z`);
+  const offsetPart = formatter.formatToParts(probe).find((part) => part.type === 'timeZoneName')?.value;
+  if (!offsetPart) {
+    throw new CliError(`Could not determine timezone offset for ${date} in ${timezone}`, EXIT_CODES.UNEXPECTED);
+  }
+  return offsetPart.replace('GMT', '');
+}
+
+function buildDateRange(date: string, timezone: string): { from: string; to: string } {
+  const offset = getOffsetForDate(date, timezone);
+  const from = new Date(`${date}T00:00:00.000${offset}`).toISOString();
+  const to = new Date(`${date}T23:59:59.999${offset}`).toISOString();
+  return { from, to };
+}
+
 async function apiGetJson<T>(url: string, headers: Record<string, string>, failureCode: number): Promise<T> {
   const response = await fetch(url, { headers });
   if (!response.ok) {
     throw new CliError(`API request failed for ${url}: ${response.status} ${response.statusText}`, failureCode);
   }
   return (await response.json()) as T;
+}
+
+async function safeApiJson<T>(url: string, headers: Record<string, string>, warnings: string[], label: string): Promise<T | undefined> {
+  try {
+    const response = await fetch(url, { headers });
+    if (!response.ok) {
+      warnings.push(`${label} request failed: ${response.status} ${response.statusText}`);
+      return undefined;
+    }
+    return (await response.json()) as T;
+  } catch (error) {
+    warnings.push(`${label} request failed: ${error instanceof Error ? error.message : String(error)}`);
+    return undefined;
+  }
 }
 
 async function saveDebugScreenshot(page: Page, debugDir: string | undefined, label: string): Promise<string | undefined> {
@@ -185,25 +262,16 @@ async function loginAndGetRegion(page: Page, username: string, password: string)
   return match[1];
 }
 
-async function fetchStudentRecords(
+async function fetchRecentMessages(
   page: Page,
   context: BrowserContext,
   region: string,
+  baseHeaders: Record<string, string>,
   warnings: string[],
-): Promise<NormalizedStudentRecord[]> {
-  const apiBase = `https://uczen.eduvulcan.pl/${region}/api`;
-  const headers = {
-    Cookie: toCookieHeader(await context.cookies()),
-    Accept: 'application/json',
-    'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36',
-  };
-
-  const contextData = await apiGetJson<ContextResponse>(`${apiBase}/Context`, headers, EXIT_CODES.API_FETCH);
-  const students = contextData.uczniowie.filter((student) => student.aktywny);
-
-  let allMessages: EduMessageListItem[] = [];
-  let messageHeaders = headers;
+): Promise<{ allMessages: EduMessageListItem[]; messageHeaders: Record<string, string> }> {
   const messagesApiBase = `https://wiadomosci.eduvulcan.pl/${region}/api`;
+  let allMessages: EduMessageListItem[] = [];
+  let messageHeaders = baseHeaders;
 
   try {
     await clickFirstAvailable(page, [
@@ -215,61 +283,93 @@ async function fetchStudentRecords(
     await sleep(2_000);
 
     messageHeaders = {
-      ...headers,
+      ...baseHeaders,
       Cookie: toCookieHeader(await context.cookies()),
     };
 
-    const received = await fetch(`${messagesApiBase}/Odebrane?idLastWiadomosc=0&pageSize=50`, {
-      headers: messageHeaders,
-    });
-
-    if (received.ok) {
-      const payload = await received.json();
-      allMessages = Array.isArray(payload) ? (payload as EduMessageListItem[]) : [];
-    } else {
-      warnings.push(`Messages list request returned ${received.status} ${received.statusText}`);
-    }
+    const payload = await safeApiJson<EduMessageListItem[]>(
+      `${messagesApiBase}/Odebrane?idLastWiadomosc=0&pageSize=50`,
+      messageHeaders,
+      warnings,
+      'Messages list',
+    );
+    allMessages = Array.isArray(payload) ? payload : [];
   } catch (error) {
     warnings.push(`Messages fetch bootstrap failed: ${error instanceof Error ? error.message : String(error)}`);
   }
 
-  const today = new Date();
-  const endDate = new Date(today.getFullYear(), today.getMonth() + 2, 0, 23, 59, 59, 999);
-  const startDate = new Date(today);
-  startDate.setDate(startDate.getDate() - 1);
+  return { allMessages, messageHeaders };
+}
 
-  const start = encodeURIComponent(startDate.toISOString());
-  const end = encodeURIComponent(endDate.toISOString());
+async function fetchStudentRecords(options: {
+  page: Page;
+  context: BrowserContext;
+  region: string;
+  targetDate: string;
+  timezone: string;
+  profile: FetchProfile;
+  warnings: string[];
+}): Promise<NormalizedStudentRecord[]> {
+  const { page, context, region, targetDate, timezone, profile, warnings } = options;
+  const apiBase = `https://uczen.eduvulcan.pl/${region}/api`;
+  const { from, to } = buildDateRange(targetDate, timezone);
+  const encodedFrom = encodeURIComponent(from);
+  const encodedTo = encodeURIComponent(to);
+
+  const headers = {
+    Cookie: toCookieHeader(await context.cookies()),
+    Accept: 'application/json',
+    'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36',
+  };
+
+  const contextData = await apiGetJson<ContextResponse>(`${apiBase}/Context`, headers, EXIT_CODES.API_FETCH);
+  const students = contextData.uczniowie.filter((student) => student.aktywny);
+  const { allMessages, messageHeaders } = await fetchRecentMessages(page, context, region, headers, warnings);
+  const messagesApiBase = `https://wiadomosci.eduvulcan.pl/${region}/api`;
 
   const records: NormalizedStudentRecord[] = [];
 
   for (const student of students) {
-    const schedulePromise = fetch(`${apiBase}/PlanZajecTablica?key=${student.key}`, { headers });
-    const gradesPromise = fetch(`${apiBase}/OcenyTablica?key=${student.key}`, { headers });
-    const homeworkListPromise = fetch(
-      `${apiBase}/SprawdzianyZadaniaDomowe?key=${student.key}&dataOd=${start}&dataDo=${end}`,
-      { headers },
+    const schedulePromise = safeApiJson<EduScheduleItem[]>(
+      `${apiBase}/PlanZajec?key=${student.key}&dataOd=${encodedFrom}&dataDo=${encodedTo}&zakresDanych=2`,
+      headers,
+      warnings,
+      `Schedule for ${student.uczen}`,
+    );
+    const homeworkListPromise = safeApiJson<EduHomeworkListItem[]>(
+      `${apiBase}/SprawdzianyZadaniaDomowe?key=${student.key}&dataOd=${encodedFrom}&dataDo=${encodedTo}`,
+      headers,
+      warnings,
+      `Homework list for ${student.uczen}`,
+    );
+    const freeDaysPromise = safeApiJson<Record<string, unknown>[]>(
+      `${apiBase}/DniWolne?key=${student.key}&dataOd=${encodedFrom}&dataDo=${encodedTo}`,
+      headers,
+      warnings,
+      `Free days for ${student.uczen}`,
     );
 
-    const [scheduleRes, gradesRes, homeworkListRes] = await Promise.all([schedulePromise, gradesPromise, homeworkListPromise]);
+    const gradesPromise = profile === 'comprehensive'
+      ? safeApiJson<EduGradeItem[]>(`${apiBase}/OcenyTablica?key=${student.key}`, headers, warnings, `Grades for ${student.uczen}`)
+      : Promise.resolve(undefined);
+    const announcementsPromise = profile === 'comprehensive'
+      ? safeApiJson<Record<string, unknown>[]>(`${apiBase}/OgloszeniaTablica?key=${student.key}`, headers, warnings, `Announcements for ${student.uczen}`)
+      : Promise.resolve(undefined);
+    const infoCardsPromise = profile === 'comprehensive'
+      ? safeApiJson<Record<string, unknown>[]>(`${apiBase}/InformacjeTablica?key=${student.key}`, headers, warnings, `Info cards for ${student.uczen}`)
+      : Promise.resolve(undefined);
 
-    const rawSchedule = scheduleRes.ok ? ((await scheduleRes.json()) as EduScheduleItem[]) : [];
-    if (!scheduleRes.ok) {
-      warnings.push(`Schedule request failed for ${student.uczen}: ${scheduleRes.status} ${scheduleRes.statusText}`);
-    }
-
-    const rawGrades = gradesRes.ok ? ((await gradesRes.json()) as EduGradeItem[]) : [];
-    if (!gradesRes.ok) {
-      warnings.push(`Grades request failed for ${student.uczen}: ${gradesRes.status} ${gradesRes.statusText}`);
-    }
-
-    const homeworkList = homeworkListRes.ok ? ((await homeworkListRes.json()) as EduHomeworkListItem[]) : [];
-    if (!homeworkListRes.ok) {
-      warnings.push(`Homework list request failed for ${student.uczen}: ${homeworkListRes.status} ${homeworkListRes.statusText}`);
-    }
+    const [rawSchedule, homeworkList, rawFreeDays, rawGrades, rawAnnouncements, rawInfoCards] = await Promise.all([
+      schedulePromise,
+      homeworkListPromise,
+      freeDaysPromise,
+      gradesPromise,
+      announcementsPromise,
+      infoCardsPromise,
+    ]);
 
     const homework: NormalizedHomeworkItem[] = [];
-    for (const item of homeworkList) {
+    for (const item of Array.isArray(homeworkList) ? homeworkList : []) {
       try {
         const detailResponse = await fetch(`${apiBase}/ZadanieDomoweSzczegoly?key=${student.key}&id=${item.id}`, { headers });
         const detail = detailResponse.ok ? ((await detailResponse.json()) as EduHomeworkDetail) : undefined;
@@ -277,6 +377,7 @@ async function fetchStudentRecords(
           warnings.push(`Homework details request failed for ${student.uczen} item ${item.id}: ${detailResponse.status} ${detailResponse.statusText}`);
         }
         homework.push({
+          id: item.id,
           type: item.typ,
           subject: item.przedmiotNazwa,
           date: item.data ?? null,
@@ -287,6 +388,7 @@ async function fetchStudentRecords(
       } catch (error) {
         warnings.push(`Homework details fetch failed for ${student.uczen} item ${item.id}: ${error instanceof Error ? error.message : String(error)}`);
         homework.push({
+          id: item.id,
           type: item.typ,
           subject: item.przedmiotNazwa,
           date: item.data ?? null,
@@ -299,7 +401,6 @@ async function fetchStudentRecords(
 
     const mappedMessages = mapMessageToStudent(student.uczen, allMessages);
     const messages: NormalizedMessageItem[] = [];
-
     for (const message of mappedMessages) {
       try {
         const detailResponse = await fetch(
@@ -337,9 +438,16 @@ async function fetchStudentRecords(
       className: student.oddzial ?? null,
       school: student.jednostka ?? null,
       schedule: normalizeSchedule(Array.isArray(rawSchedule) ? rawSchedule : []),
-      grades: normalizeGrades(Array.isArray(rawGrades) ? rawGrades : []),
       homework,
       messages,
+      freeDays: normalizeFreeDays(Array.isArray(rawFreeDays) ? rawFreeDays : []),
+      extended: profile === 'comprehensive'
+        ? {
+            announcements: Array.isArray(rawAnnouncements) ? rawAnnouncements : [],
+            infoCards: Array.isArray(rawInfoCards) ? rawInfoCards : [],
+            grades: normalizeGrades(Array.isArray(rawGrades) ? rawGrades : []),
+          }
+        : undefined,
     });
   }
 
@@ -351,19 +459,41 @@ export async function fetchSnapshot(options: {
   password: string;
   headless: boolean;
   debugDir?: string;
+  targetDate?: string;
+  timezone?: string;
+  profile?: FetchProfile;
 }): Promise<NormalizedSnapshot> {
   const startedAt = Date.now();
   const warnings: string[] = [];
+  const timezone = options.timezone || DEFAULT_TIMEZONE;
+  const targetDate = resolveTargetDate(options.targetDate, timezone);
+  const { from, to } = buildDateRange(targetDate, timezone);
+  const profile = options.profile || 'standard';
   const { browser, context, page } = await launchBrowser(options.headless);
 
   try {
     const region = await loginAndGetRegion(page, options.username, options.password);
-    const students = await fetchStudentRecords(page, context, region, warnings);
+    const students = await fetchStudentRecords({
+      page,
+      context,
+      region,
+      targetDate,
+      timezone,
+      profile,
+      warnings,
+    });
 
     return {
       fetchedAt: new Date().toISOString(),
       source: 'eduvulcan',
       status: warnings.length > 0 ? 'partial' : 'ok',
+      targetDate,
+      dateRange: {
+        from,
+        to,
+        timezone,
+      },
+      profile,
       students,
       meta: {
         region,

@@ -31,10 +31,22 @@ After building, you can use the standalone wrapper directly:
 ./bin/eduvulcan-fetch
 ```
 
-Fetch and print to stdout:
+Fetch and print today's day snapshot to stdout:
 
 ```bash
 pnpm fetch
+```
+
+Fetch tomorrow's schedule/homework context:
+
+```bash
+./bin/eduvulcan-fetch --date tomorrow
+```
+
+Fetch a specific day with the extended/comprehensive endpoint set:
+
+```bash
+./bin/eduvulcan-fetch --date 2026-03-13 --profile comprehensive
 ```
 
 Fetch and store dated snapshots:
@@ -46,7 +58,7 @@ Fetch and store dated snapshots:
 Fetch to an explicit file:
 
 ```bash
-./bin/eduvulcan-fetch --output ./data/2026-03-11.json
+./bin/eduvulcan-fetch --date 2026-03-13 --output ./data/2026-03-13.json
 ```
 
 Show help:
@@ -64,19 +76,27 @@ Successful fetch returns normalized JSON like:
   "fetchedAt": "2026-03-11T06:00:12.000Z",
   "source": "eduvulcan",
   "status": "ok",
+  "targetDate": "2026-03-12",
+  "dateRange": {
+    "from": "2026-03-11T23:00:00.000Z",
+    "to": "2026-03-12T22:59:59.999Z",
+    "timezone": "Europe/Warsaw"
+  },
+  "profile": "standard",
   "students": [],
   "meta": {
     "region": "wroclaw",
     "durationMs": 12345,
-    "version": "0.1.0",
+    "version": "0.2.0",
     "warnings": []
   }
 }
 ```
 
 If `--output-dir` is used, the CLI writes:
-- `YYYY-MM-DD.json`
-- `latest.json`
+- `YYYY-MM-DD.json` for the standard profile
+- `YYYY-MM-DD.comprehensive.json` for the comprehensive profile
+- `latest.json` / `latest.comprehensive.json`
 
 Writes are atomic.
 

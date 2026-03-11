@@ -8,6 +8,8 @@ export const EXIT_CODES = {
   UNEXPECTED: 15,
 } as const;
 
+export type FetchProfile = 'standard' | 'comprehensive';
+
 export interface StudentContext {
   key: string;
   uczen: string;
@@ -88,6 +90,7 @@ export interface NormalizedGradeItem {
 }
 
 export interface NormalizedHomeworkItem {
+  id?: number;
   type: number;
   subject: string;
   date: string | null;
@@ -105,21 +108,42 @@ export interface NormalizedMessageItem {
   body: string | null;
 }
 
+export interface NormalizedFreeDayItem {
+  date: string | null;
+  title: string | null;
+  description: string | null;
+  raw: Record<string, unknown>;
+}
+
+export interface NormalizedExtendedStudentData {
+  announcements?: Record<string, unknown>[];
+  infoCards?: Record<string, unknown>[];
+  grades?: NormalizedGradeItem[];
+}
+
 export interface NormalizedStudentRecord {
   studentKey: string;
   name: string;
   className: string | null;
   school: string | null;
   schedule: NormalizedScheduleItem[];
-  grades: NormalizedGradeItem[];
   homework: NormalizedHomeworkItem[];
   messages: NormalizedMessageItem[];
+  freeDays: NormalizedFreeDayItem[];
+  extended?: NormalizedExtendedStudentData;
 }
 
 export interface NormalizedSnapshot {
   fetchedAt: string;
   source: 'eduvulcan';
   status: 'ok' | 'partial';
+  targetDate: string;
+  dateRange: {
+    from: string;
+    to: string;
+    timezone: string;
+  };
+  profile: FetchProfile;
   students: NormalizedStudentRecord[];
   meta: {
     region: string;
