@@ -9,7 +9,9 @@
   "scripts": {
     "build": "tsc -p tsconfig.json",
     "typecheck": "tsc --noEmit -p tsconfig.json",
-    "test": "bash tests/fetch-with-retries.test.sh",
+    "test:unit": "tsx --test tests/browser-api-fetch.test.ts",
+    "test:shell": "bash tests/fetch-with-retries.test.sh",
+    "test": "pnpm run test:unit && pnpm run test:shell",
     "fetch": "tsx src/cli.ts fetch",
     "dev": "tsx src/cli.ts",
     "start": "node dist/cli.js"

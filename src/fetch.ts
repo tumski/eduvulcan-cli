@@ -1,6 +1,6 @@
 import { mkdir, writeFile } from 'node:fs/promises';
 import { dirname, join } from 'node:path';
-import type { BrowserContext, Page } from 'playwright';
+import type { Page } from 'playwright';
 import { launchBrowser } from './browser.js';
 import type {
   ContextResponse,
@@ -38,13 +38,6 @@ async function clickFirstAvailable(page: Page, selectors: string[], timeoutMs = 
     }
   }
   return null;
-}
-
-function toCookieHeader(cookies: Awaited<ReturnType<BrowserContext['cookies']>>): string {
-  return cookies
-    .filter((cookie) => cookie.domain.includes('eduvulcan.pl'))
-    .map((cookie) => `${cookie.name}=${cookie.value}`)
-    .join('; ');
 }
 
 function stripHtml(input: string | undefined): string | null {
@@ -156,22 +149,56 @@ function buildDateRange(date: string, timezone: string): { from: string; to: str
   return { from, to };
 }
 
-async function apiGetJson<T>(url: string, headers: Record<string, string>, failureCode: number): Promise<T> {
-  const response = await fetch(url, { headers });
+type PageEvaluator = Pick<Page, 'evaluate'>;
+
+interface BrowserJsonResult<T> {
+  ok: boolean;
+  status: number;
+  statusText: string;
+  data?: T;
+}
+
+export async function fetchJsonInPage<T>(page: PageEvaluator, url: string, headers: Record<string, string>): Promise<BrowserJsonResult<T>> {
+  return page.evaluate(async ({ requestUrl, requestHeaders }) => {
+    const response = await fetch(requestUrl, {
+      method: 'GET',
+      headers: requestHeaders,
+      credentials: 'include',
+    });
+
+    if (!response.ok) {
+      return {
+        ok: false,
+        status: response.status,
+        statusText: response.statusText,
+      };
+    }
+
+    return {
+      ok: true,
+      status: response.status,
+      statusText: response.statusText,
+      data: (await response.json()) as T,
+    };
+  }, { requestUrl: url, requestHeaders: headers });
+}
+
+async function apiGetJson<T>(page: PageEvaluator, url: string, headers: Record<string, string>, failureCode: number): Promise<T> {
+  const response = await fetchJsonInPage<T>(page, url, headers);
   if (!response.ok) {
     throw new CliError(`API request failed for ${url}: ${response.status} ${response.statusText}`, failureCode);
   }
-  return (await response.json()) as T;
+  return response.data as T;
 }
 
-async function safeApiJson<T>(url: string, headers: Record<string, string>, warnings: string[], label: string): Promise<T | undefined> {
+async function safeApiJson<T>(page: PageEvaluator, url: string, headers: Record<string, string>, warnings: string[], label: string): Promise<T | undefined> {
   try {
-    const response = await fetch(url, { headers });
+    const response = await fetchJsonInPage<T>(page, url, headers);
     if (!response.ok) {
       warnings.push(`${label} request failed: ${response.status} ${response.statusText}`);
       return undefined;
     }
-    return (await response.json()) as T;
+    return response.data as T;
   } catch (error) {
     warnings.push(`${label} request failed: ${error instanceof Error ? error.message : String(error)}`);
     return undefined;
@@ -264,14 +291,12 @@ async function loginAndGetRegion(page: Page, username: string, password: string)
 
 async function fetchRecentMessages(
   page: Page,
-  context: BrowserContext,
   region: string,
-  baseHeaders: Record<string, string>,
+  headers: Record<string, string>,
   warnings: string[],
-): Promise<{ allMessages: EduMessageListItem[]; messageHeaders: Record<string, string> }> {
+): Promise<EduMessageListItem[]> {
   const messagesApiBase = `https://wiadomosci.eduvulcan.pl/${region}/api`;
   let allMessages: EduMessageListItem[] = [];
-  let messageHeaders = baseHeaders;
 
   try {
     await clickFirstAvailable(page, [
@@ -282,14 +307,10 @@ async function fetchRecentMessages(
     await page.waitForLoadState('networkidle');
     await sleep(2_000);
 
-    messageHeaders = {
-      ...baseHeaders,
-      Cookie: toCookieHeader(await context.cookies()),
-    };
-
     const payload = await safeApiJson<EduMessageListItem[]>(
+      page,
       `${messagesApiBase}/Odebrane?idLastWiadomosc=0&pageSize=50`,
-      messageHeaders,
+      headers,
       warnings,
       'Messages list',
     );
@@ -298,51 +319,49 @@ async function fetchRecentMessages(
     warnings.push(`Messages fetch bootstrap failed: ${error instanceof Error ? error.message : String(error)}`);
   }
 
-  return { allMessages, messageHeaders };
+  return allMessages;
 }
 
 async function fetchStudentRecords(options: {
   page: Page;
-  context: BrowserContext;
   region: string;
   targetDate: string;
   timezone: string;
   profile: FetchProfile;
   warnings: string[];
 }): Promise<NormalizedStudentRecord[]> {
-  const { page, context, region, targetDate, timezone, profile, warnings } = options;
+  const { page, region, targetDate, timezone, profile, warnings } = options;
   const apiBase = `https://uczen.eduvulcan.pl/${region}/api`;
   const { from, to } = buildDateRange(targetDate, timezone);
   const encodedFrom = encodeURIComponent(from);
   const encodedTo = encodeURIComponent(to);
 
   const headers = {
-    Cookie: toCookieHeader(await context.cookies()),
     Accept: 'application/json',
-    'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36',
   };
 
-  const contextData = await apiGetJson<ContextResponse>(`${apiBase}/Context`, headers, EXIT_CODES.API_FETCH);
+  const contextData = await apiGetJson<ContextResponse>(page, `${apiBase}/Context`, headers, EXIT_CODES.API_FETCH);
   const students = contextData.uczniowie.filter((student) => student.aktywny);
-  const { allMessages, messageHeaders } = await fetchRecentMessages(page, context, region, headers, warnings);
-  const messagesApiBase = `https://wiadomosci.eduvulcan.pl/${region}/api`;
 
   const records: NormalizedStudentRecord[] = [];
 
   for (const student of students) {
     const schedulePromise = safeApiJson<EduScheduleItem[]>(
+      page,
       `${apiBase}/PlanZajec?key=${student.key}&dataOd=${encodedFrom}&dataDo=${encodedTo}&zakresDanych=2`,
       headers,
       warnings,
       `Schedule for ${student.uczen}`,
     );
     const homeworkListPromise = safeApiJson<EduHomeworkListItem[]>(
+      page,
       `${apiBase}/SprawdzianyZadaniaDomowe?key=${student.key}&dataOd=${encodedFrom}&dataDo=${encodedTo}`,
       headers,
       warnings,
       `Homework list for ${student.uczen}`,
     );
     const freeDaysPromise = safeApiJson<Record<string, unknown>[]>(
+      page,
       `${apiBase}/DniWolne?key=${student.key}&dataOd=${encodedFrom}&dataDo=${encodedTo}`,
       headers,
       warnings,
@@ -350,13 +369,13 @@ async function fetchStudentRecords(options: {
     );
 
     const gradesPromise = profile === 'comprehensive'
-      ? safeApiJson<EduGradeItem[]>(`${apiBase}/OcenyTablica?key=${student.key}`, headers, warnings, `Grades for ${student.uczen}`)
+      ? safeApiJson<EduGradeItem[]>(page, `${apiBase}/OcenyTablica?key=${student.key}`, headers, warnings, `Grades for ${student.uczen}`)
       : Promise.resolve(undefined);
     const announcementsPromise = profile === 'comprehensive'
-      ? safeApiJson<Record<string, unknown>[]>(`${apiBase}/OgloszeniaTablica?key=${student.key}`, headers, warnings, `Announcements for ${student.uczen}`)
+      ? safeApiJson<Record<string, unknown>[]>(page, `${apiBase}/OgloszeniaTablica?key=${student.key}`, headers, warnings, `Announcements for ${student.uczen}`)
       : Promise.resolve(undefined);
     const infoCardsPromise = profile === 'comprehensive'
-      ? safeApiJson<Record<string, unknown>[]>(`${apiBase}/InformacjeTablica?key=${student.key}`, headers, warnings, `Info cards for ${student.uczen}`)
+      ? safeApiJson<Record<string, unknown>[]>(page, `${apiBase}/InformacjeTablica?key=${student.key}`, headers, warnings, `Info cards for ${student.uczen}`)
       : Promise.resolve(undefined);
 
     const [rawSchedule, homeworkList, rawFreeDays, rawGrades, rawAnnouncements, rawInfoCards] = await Promise.all([
@@ -371,8 +390,12 @@ async function fetchStudentRecords(options: {
     const homework: NormalizedHomeworkItem[] = [];
     for (const item of Array.isArray(homeworkList) ? homeworkList : []) {
       try {
-        const detailResponse = await fetch(`${apiBase}/ZadanieDomoweSzczegoly?key=${student.key}&id=${item.id}`, { headers });
-        const detail = detailResponse.ok ? ((await detailResponse.json()) as EduHomeworkDetail) : undefined;
+        const detailResponse = await fetchJsonInPage<EduHomeworkDetail>(
+          page,
+          `${apiBase}/ZadanieDomoweSzczegoly?key=${student.key}&id=${item.id}`,
+          headers,
+        );
+        const detail = detailResponse.ok ? detailResponse.data : undefined;
         if (!detailResponse.ok) {
           warnings.push(`Homework details request failed for ${student.uczen} item ${item.id}: ${detailResponse.status} ${detailResponse.statusText}`);
         }
@@ -399,17 +422,42 @@ async function fetchStudentRecords(options: {
       }
     }
 
-    const mappedMessages = mapMessageToStudent(student.uczen, allMessages);
+    records.push({
+      studentKey: student.key,
+      name: student.uczen,
+      className: student.oddzial ?? null,
+      school: student.jednostka ?? null,
+      schedule: normalizeSchedule(Array.isArray(rawSchedule) ? rawSchedule : []),
+      homework,
+      messages: [],
+      freeDays: normalizeFreeDays(Array.isArray(rawFreeDays) ? rawFreeDays : []),
+      extended: profile === 'comprehensive'
+        ? {
+            announcements: Array.isArray(rawAnnouncements) ? rawAnnouncements : [],
+            infoCards: Array.isArray(rawInfoCards) ? rawInfoCards : [],
+            grades: normalizeGrades(Array.isArray(rawGrades) ? rawGrades : []),
+          }
+        : undefined,
+    });
+  }
+
+  const allMessages = await fetchRecentMessages(page, region, headers, warnings);
+  const messagesApiBase = `https://wiadomosci.eduvulcan.pl/${region}/api`;
+
+  for (const record of records) {
+    const mappedMessages = mapMessageToStudent(record.name, allMessages);
     const messages: NormalizedMessageItem[] = [];
+
     for (const message of mappedMessages) {
       try {
-        const detailResponse = await fetch(
+        const detailResponse = await fetchJsonInPage<EduMessageDetail>(
+          page,
           `${messagesApiBase}/WiadomoscSzczegoly?apiGlobalKey=${message.apiGlobalKey}`,
-          { headers: messageHeaders },
+          headers,
         );
-        const detail = detailResponse.ok ? ((await detailResponse.json()) as EduMessageDetail) : undefined;
+        const detail = detailResponse.ok ? detailResponse.data : undefined;
         if (!detailResponse.ok) {
-          warnings.push(`Message details request failed for ${student.uczen} message ${message.apiGlobalKey}: ${detailResponse.status} ${detailResponse.statusText}`);
+          warnings.push(`Message details request failed for ${record.name} message ${message.apiGlobalKey}: ${detailResponse.status} ${detailResponse.statusText}`);
         }
         messages.push({
           id: message.apiGlobalKey,
@@ -420,7 +468,7 @@ async function fetchStudentRecords(options: {
           body: truncate(stripHtml(detail?.tresc)),
         });
       } catch (error) {
-        warnings.push(`Message details fetch failed for ${student.uczen} message ${message.apiGlobalKey}: ${error instanceof Error ? error.message : String(error)}`);
+        warnings.push(`Message details fetch failed for ${record.name} message ${message.apiGlobalKey}: ${error instanceof Error ? error.message : String(error)}`);
         messages.push({
           id: message.apiGlobalKey,
           sender: message.korespondenci.split(' - ')[0] ?? null,
@@ -432,23 +480,7 @@ async function fetchStudentRecords(options: {
       }
     }
 
-    records.push({
-      studentKey: student.key,
-      name: student.uczen,
-      className: student.oddzial ?? null,
-      school: student.jednostka ?? null,
-      schedule: normalizeSchedule(Array.isArray(rawSchedule) ? rawSchedule : []),
-      homework,
-      messages,
-      freeDays: normalizeFreeDays(Array.isArray(rawFreeDays) ? rawFreeDays : []),
-      extended: profile === 'comprehensive'
-        ? {
-            announcements: Array.isArray(rawAnnouncements) ? rawAnnouncements : [],
-            infoCards: Array.isArray(rawInfoCards) ? rawInfoCards : [],
-            grades: normalizeGrades(Array.isArray(rawGrades) ? rawGrades : []),
-          }
-        : undefined,
-    });
+    record.messages = messages;
   }
 
   return records;
@@ -475,7 +507,6 @@ export async function fetchSnapshot(options: {
     const region = await loginAndGetRegion(page, options.username, options.password);
     const students = await fetchStudentRecords({
       page,
-      context,
       region,
       targetDate,
       timezone,

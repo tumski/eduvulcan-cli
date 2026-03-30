@@ -23,19 +23,26 @@ acquire_lock() {
     return 0
   fi
 
-  if [[ -f "$LOCK_PID_FILE" ]]; then
-    local existing_pid
-    existing_pid="$(cat "$LOCK_PID_FILE" 2>/dev/null || true)"
+  if [[ ! -f "$LOCK_PID_FILE" ]]; then
+    if rmdir "$LOCK_DIR" 2>/dev/null && mkdir "$LOCK_DIR" 2>/dev/null; then
+      printf '%s\n' "$$" > "$LOCK_PID_FILE"
+      log_line "Cleared stale fetch lock without PID metadata."
+      return 0
+    fi
+    return 1
+  fi
 
-    if [[ -n "$existing_pid" ]] && ! kill -0 "$existing_pid" 2>/dev/null; then
-      rm -f "$LOCK_PID_FILE"
-      rmdir "$LOCK_DIR" 2>/dev/null || true
+  local existing_pid
+  existing_pid="$(cat "$LOCK_PID_FILE" 2>/dev/null || true)"
 
-      if mkdir "$LOCK_DIR" 2>/dev/null; then
-        printf '%s\n' "$$" > "$LOCK_PID_FILE"
-        log_line "Cleared stale fetch lock for PID ${existing_pid}."
-        return 0
-      fi
+  if [[ -n "$existing_pid" ]] && ! kill -0 "$existing_pid" 2>/dev/null; then
+    rm -f "$LOCK_PID_FILE"
+    rmdir "$LOCK_DIR" 2>/dev/null || true
+
+    if mkdir "$LOCK_DIR" 2>/dev/null; then
+      printf '%s\n' "$$" > "$LOCK_PID_FILE"
+      log_line "Cleared stale fetch lock for PID ${existing_pid}."
+      return 0
     fi
   fi
 

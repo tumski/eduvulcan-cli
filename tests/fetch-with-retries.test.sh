@@ -106,8 +106,27 @@ run_stale_lock_should_be_recovered() {
   assert_file_contains "$log_file" "Attempt 1 succeeded."
 }
 
+run_lock_dir_without_pid_should_be_recovered() {
+  local root marker log_file
+  root="$(make_test_root)"
+  marker="$root/marker.log"
+  log_file="$root/logs/$(date +%F)-fetch.log"
+
+  mkdir "$root/.fetch.lock"
+
+  (
+    cd "$root"
+    FETCH_STUB_MARKER="$marker" ./scripts/fetch-with-retries.sh
+  )
+
+  [[ -f "$marker" ]] || fail "expected fetch stub to run after stale lock dir recovery"
+  assert_file_contains "$log_file" "Cleared stale fetch lock without PID metadata."
+  assert_file_contains "$log_file" "Attempt 1 succeeded."
+}
+
 run_without_flock_should_still_fetch
 run_concurrent_invocation_should_log_lock_and_exit_cleanly
 run_stale_lock_should_be_recovered
+run_lock_dir_without_pid_should_be_recovered
 
 echo "PASS: fetch-with-retries portability tests"

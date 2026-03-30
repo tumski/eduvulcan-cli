@@ -111,11 +111,15 @@ A retrying wrapper is included:
 
 It writes logs to `./logs/YYYY-MM-DD-fetch.log`, stores snapshots in `./data/`, retries with backoff, and explicitly runs the standalone standard day fetch (`--date today --profile standard`). The wrapper uses a portable lock directory (`.fetch.lock`) with stale-lock recovery, so it works on macOS and Linux without requiring `flock`.
 
-Run the wrapper portability test suite with:
+Run the automated tests with:
 
 ```bash
 pnpm test
 ```
+
+That covers:
+- browser-context API fetch unit tests
+- wrapper portability/locking shell tests
 
 If you want a classic system cron entry on a machine that allows `crontab`, run:
 
