@@ -17,11 +17,42 @@ Why this exists:
 ## Setup
 
 ```bash
-cd ../eduvulcan-cli
 pnpm install
 pnpm exec playwright install chromium
 cp .env.example .env
-# then fill in EDUVULCAN_USERNAME / EDUVULCAN_PASSWORD
+```
+
+Fill in the account that can already sign in at <https://eduvulcan.pl/logowanie>:
+
+```bash
+EDUVULCAN_USERNAME=you@example.com
+EDUVULCAN_PASSWORD=super-secret
+BROWSER_HEADLESS=true
+TZ=Europe/Warsaw
+```
+
+`SITE_EDUVULCAN_USERNAME` and `SITE_EDUVULCAN_PASSWORD` are still accepted. The process reads `.env.local` and then `.env`, and it does not override variables that are already set in the environment.
+
+## Live fetch
+
+From a machine that has those credentials and can reach EduVulcan:
+
+```bash
+pnpm fetch
+# or, after pnpm build:
+./bin/eduvulcan-fetch --date today --profile standard --output-dir ./data
+```
+
+A successful run prints the normalized snapshot and exits `0`. `meta.region` is the tenant slug (for example `zyrardow`) and `students` comes from `GET /<tenant>/api/Context`.
+
+This repository does not ship credentials. Without `EDUVULCAN_USERNAME` / `EDUVULCAN_PASSWORD` the CLI exits `10` before it opens a browser.
+
+## Offline check
+
+The cloud agent and CI do not need a live Vulcan account. The WS-Fed handoff is covered by unit tests, including the raw `>` case that used to truncate `wresult`:
+
+```bash
+pnpm test
 ```
 
 ## Usage
@@ -88,7 +119,7 @@ Successful fetch returns normalized JSON like:
   "meta": {
     "region": "wroclaw",
     "durationMs": 12345,
-    "version": "0.2.0",
+    "version": "0.3.0",
     "warnings": []
   }
 }
@@ -126,6 +157,16 @@ If you want a classic system cron entry on a machine that allows `crontab`, run:
 ```bash
 ./scripts/install-cron.sh
 ```
+
+## Login handoff
+
+Playwright is still used only to sign in at `eduvulcan.pl` (the proof-of-work captcha, when shown, runs in that page). After login the CLI opens `https://eduvulcan.pl/dostep-do-dziennika/`, reads the `/dziennik?` links, and finishes WS-Federation itself with the browser cookie jar.
+
+That second step is deliberate. The parent portal still returns to `https://uczen.eduvulcan.pl/<tenant>/Start?profil=...`, and that route now responds with "Strona nie została odnaleziona". Driving Chromium onto it does not leave a session that can call `/api/Context` (the call comes back 404, exit `13`). Posting the `wresult` form over HTTP does. The SAML token is a quoted attribute that contains raw `>` characters, so the parser has to be quote-aware; a `<input[^>]*>` scan truncates the token and the federation POST is rejected.
+
+Diary calls (`Context`, `PlanZajec`, `SprawdzianyZadaniaDomowe`, and the comprehensive tablica endpoints) then go out through that same cookie jar. They do not depend on the dead Start page.
+
+The messages host (`wiadomosci.eduvulcan.pl`) is a separate WS-Fed chain. If that inbox session still fails, the snapshot stays partial: schedule, homework, and free days are kept, and the failure is listed in `meta.warnings`.
 
 ## Exit codes
 

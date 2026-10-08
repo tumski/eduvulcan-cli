@@ -1,7 +1,13 @@
 import { mkdir, writeFile } from 'node:fs/promises';
 import { dirname, join } from 'node:path';
-import type { Page } from 'playwright';
+import type { APIRequestContext, Page } from 'playwright';
 import { launchBrowser } from './browser.js';
+import {
+  completeWsFedChain,
+  orderJournalHandoffs,
+  type HttpClient,
+  type HttpResponseLike,
+} from './wsfed.js';
 import type {
   ContextResponse,
   EduGradeItem,
@@ -23,22 +29,10 @@ import type {
 import { CliError, EXIT_CODES } from './types.js';
 
 const LOGIN_URL = 'https://eduvulcan.pl/logowanie';
-const VERSION = '0.2.0';
+const VERSION = '0.3.0';
 const DEFAULT_TIMEZONE = process.env.TZ || 'Europe/Warsaw';
 
 const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
-
-async function clickFirstAvailable(page: Page, selectors: string[], timeoutMs = 3_000): Promise<string | null> {
-  for (const selector of selectors) {
-    try {
-      await page.locator(selector).first().click({ timeout: timeoutMs });
-      return selector;
-    } catch {
-      // try next selector
-    }
-  }
-  return null;
-}
 
 function stripHtml(input: string | undefined): string | null {
   if (!input) return null;
@@ -183,17 +177,107 @@ export async function fetchJsonInPage<T>(page: PageEvaluator, url: string, heade
   }, { requestUrl: url, requestHeaders: headers });
 }
 
-async function apiGetJson<T>(page: PageEvaluator, url: string, headers: Record<string, string>, failureCode: number): Promise<T> {
-  const response = await fetchJsonInPage<T>(page, url, headers);
-  if (!response.ok) {
-    throw new CliError(`API request failed for ${url}: ${response.status} ${response.statusText}`, failureCode);
-  }
-  return response.data as T;
+function withHeaders(client: HttpClient, headers: Record<string, string>): HttpClient {
+  return {
+    request(url, init) {
+      return client.request(url, {
+        ...init,
+        headers: { ...headers, ...init.headers },
+      });
+    },
+  };
 }
 
-async function safeApiJson<T>(page: PageEvaluator, url: string, headers: Record<string, string>, warnings: string[], label: string): Promise<T | undefined> {
+function diaryApiHeaders(region: string): Record<string, string> {
+  return {
+    Accept: 'application/json, text/plain, */*',
+    Origin: 'https://uczen.eduvulcan.pl',
+    Referer: `https://uczen.eduvulcan.pl/${region}/App`,
+    'X-Requested-With': 'XMLHttpRequest',
+  };
+}
+
+function messagesApiHeaders(region: string): Record<string, string> {
+  return {
+    Accept: 'application/json, text/plain, */*',
+    Origin: 'https://wiadomosci.eduvulcan.pl',
+    Referer: `https://wiadomosci.eduvulcan.pl/${region}/App`,
+    'X-Requested-With': 'XMLHttpRequest',
+  };
+}
+
+function asHttpClient(request: APIRequestContext): HttpClient {
+  return {
+    async request(url, init): Promise<HttpResponseLike> {
+      const options = {
+        headers: init.headers,
+        form: init.form,
+        maxRedirects: 20,
+        failOnStatusCode: false,
+      };
+      const response = init.method === 'POST'
+        ? await request.post(url, options)
+        : await request.get(url, options);
+      return {
+        url: response.url(),
+        status: response.status(),
+        headers: response.headers(),
+        text: () => response.text(),
+      };
+    },
+  };
+}
+
+function summarizeBody(body: string): string {
+  const compact = body.replace(/\s+/g, ' ').trim();
+  if (!compact) return 'empty response';
+  if (compact.startsWith('{') || compact.startsWith('[')) return compact.slice(0, 180);
+  if (/Strona nie została odnaleziona/i.test(compact)) return 'Strona nie została odnaleziona';
+  if (/Brak uprawnień/i.test(compact)) return 'Brak uprawnień';
+  return 'HTML response';
+}
+
+async function readJson<T>(client: HttpClient, url: string): Promise<BrowserJsonResult<T>> {
+  const response = await client.request(url, {
+    method: 'GET',
+    headers: { Accept: 'application/json' },
+  });
+  const body = await response.text();
+  if (response.status < 200 || response.status >= 300) {
+    return {
+      ok: false,
+      status: response.status,
+      statusText: summarizeBody(body),
+    };
+  }
+
   try {
-    const response = await fetchJsonInPage<T>(page, url, headers);
+    return {
+      ok: true,
+      status: response.status,
+      statusText: 'OK',
+      data: JSON.parse(body) as T,
+    };
+  } catch {
+    return {
+      ok: false,
+      status: response.status,
+      statusText: summarizeBody(body),
+    };
+  }
+}
+
+async function apiGetJson<T>(client: HttpClient, url: string, failureCode: number): Promise<T> {
+  const response = await readJson<T>(client, url);
+  if (!response.ok || response.data === undefined) {
+    throw new CliError(`API request failed for ${url}: ${response.status} ${response.statusText}`, failureCode);
+  }
+  return response.data;
+}
+
+async function safeApiJson<T>(client: HttpClient, url: string, warnings: string[], label: string): Promise<T | undefined> {
+  try {
+    const response = await readJson<T>(client, url);
     if (!response.ok) {
       warnings.push(`${label} request failed: ${response.status} ${response.statusText}`);
       return undefined;
@@ -214,168 +298,192 @@ async function saveDebugScreenshot(page: Page, debugDir: string | undefined, lab
   return filePath;
 }
 
-async function loginAndGetRegion(page: Page, username: string, password: string): Promise<string> {
-  await page.goto(LOGIN_URL);
-  await page.waitForLoadState('domcontentloaded');
-  await sleep(1_000);
+const JOURNAL_PICKER_URL = 'https://eduvulcan.pl/dostep-do-dziennika/';
 
+async function dismissCookieBanner(page: Page, timeoutMs: number): Promise<void> {
   try {
     const cookieFrame = page.frameLocator('#respect-privacy-frame');
-    await cookieFrame.locator('button:has-text("Zgadzam się")').click({ timeout: 5_000 });
-    await sleep(1_500);
+    await cookieFrame.locator('button:has-text("Zgadzam się"), button:has-text("Akceptuję")').first().click({ timeout: timeoutMs });
+    await sleep(500);
   } catch {
     // no popup or already dismissed
   }
+}
 
-  const emailInput = page.locator('input[name="Login"], input[placeholder="Login"], input[type="text"]').first();
+async function dismissJournalOverlays(page: Page): Promise<void> {
+  for (const selector of ['.vdpo-tutorial-tooltip__close', '.vdpo-journal-shortcut__close']) {
+    try {
+      await page.locator(selector).first().click({ timeout: 1_500 });
+    } catch {
+      // overlay not present
+    }
+  }
+}
+
+async function loginParentPortal(page: Page, username: string, password: string): Promise<void> {
+  await page.goto(LOGIN_URL);
+  await page.waitForLoadState('domcontentloaded');
+  await dismissCookieBanner(page, 5_000);
+
+  const emailInput = page.locator('#UserName, input[name="UserName"], input[name="Login"], input[type="text"]').first();
   await emailInput.waitFor({ state: 'visible', timeout: 8_000 });
   await emailInput.fill(username);
 
-  await page.locator('button:has-text("Dalej"), button:has-text("Next")').first().click();
-  await sleep(2_000);
+  const userInfo = page.waitForResponse(
+    (response) => response.url().includes('/Account/QueryUserInfo'),
+    { timeout: 8_000 },
+  ).catch(() => undefined);
+  await page.locator('#btNext, button:has-text("Dalej"), button:has-text("Next")').first().click();
 
-  const passwordInput = page.locator('input[type="password"], input[name="Haslo"]').first();
+  const passwordInput = page.locator('#Password, input[type="password"], input[name="Haslo"]').first();
   await passwordInput.waitFor({ state: 'visible', timeout: 8_000 });
   await passwordInput.fill(password);
-  await page.locator('button:has-text("Zaloguj")').first().click();
+  await userInfo;
+  await sleep(300);
 
+  const captcha = page.locator('#captcha');
+  if (await captcha.isVisible().catch(() => false)) {
+    await page.locator('#captcha-success-wrapper.active').waitFor({ timeout: 25_000 }).catch(() => undefined);
+  }
+
+  await page.locator('#btLogOn, button:has-text("Zaloguj")').first().click();
   await page.waitForLoadState('domcontentloaded');
-  await sleep(3_000);
+  await page.waitForURL((url) => !url.pathname.toLowerCase().includes('logowanie'), { timeout: 20_000 }).catch(() => undefined);
+}
 
-  let currentUrl = page.url();
-  if (currentUrl.includes('logowanie') || currentUrl.includes('eduvulcan.pl/Account')) {
-    await sleep(3_000);
-    currentUrl = page.url();
+async function collectJournalHandoffs(page: Page): Promise<string[]> {
+  await dismissJournalOverlays(page);
+  await page.locator('a[href*="/dziennik"], a[href*="uczen.eduvulcan.pl"]').first().waitFor({ timeout: 12_000 }).catch(() => undefined);
+  const hrefs = await page.locator('a[href]').evaluateAll((anchors) => anchors.map((anchor) => (anchor as HTMLAnchorElement).href));
+  return orderJournalHandoffs(hrefs);
+}
+
+async function openJournalPicker(page: Page): Promise<string[]> {
+  let links = await collectJournalHandoffs(page);
+  if (links.length > 0) return links;
+
+  await page.goto(JOURNAL_PICKER_URL, { waitUntil: 'domcontentloaded' });
+  await dismissCookieBanner(page, 3_000);
+  links = await collectJournalHandoffs(page);
+  return links;
+}
+
+async function establishPortalSession(page: Page, request: APIRequestContext, username: string, password: string): Promise<{ region: string; client: HttpClient }> {
+  await loginParentPortal(page, username, password);
+  const client = asHttpClient(request);
+  const links = await openJournalPicker(page);
+
+  if (links.length === 0) {
+    throw new CliError(
+      `Could not find a journal handoff link after login. Current URL: ${page.url()}`,
+      EXIT_CODES.LOGIN_OR_NAVIGATION,
+    );
   }
 
-  if (!currentUrl.includes('uczen.eduvulcan.pl')) {
-    const selectedBy = await clickFirstAvailable(page, [
-      'a.connected-account',
-      'a[href^="/dziennik?"]',
-      'a.connected-account:has-text("(SP")',
-      'a[href*="uczen.eduvulcan.pl"]',
-      'button:has-text("Wybierz"), button:has-text("Przejdź")',
-      '[data-testid*="student"]',
-      '[class*="student"]',
-      '[class*="card"]',
-    ], 5_000);
-
-    if (!selectedBy) {
-      throw new CliError('Could not find student card after login.', EXIT_CODES.LOGIN_OR_NAVIGATION);
-    }
-
-    await page.waitForLoadState('domcontentloaded');
-    await sleep(5_000);
-    currentUrl = page.url();
-
+  const failures: string[] = [];
+  for (const link of links) {
     try {
-      const cookieFrame = page.frameLocator('#respect-privacy-frame');
-      await cookieFrame.locator('button:has-text("Zgadzam się")').click({ timeout: 3_000 });
-      await sleep(1_000);
-    } catch {
-      // ignore
+      const chain = await completeWsFedChain(client, link);
+      const region = chain.region;
+      if (!region) {
+        failures.push(`${link} ended at ${chain.finalUrl} (${chain.status}) without a tenant`);
+        continue;
+      }
+
+      const contextUrl = `https://uczen.eduvulcan.pl/${region}/api/Context`;
+      const probe = await readJson<ContextResponse>(withHeaders(client, diaryApiHeaders(region)), contextUrl);
+      const students = probe.ok && probe.data && Array.isArray(probe.data.uczniowie) ? probe.data.uczniowie : null;
+      if (students) {
+        return { region, client };
+      }
+
+      const landing = chain.notFound ? ' landing page was not found;' : '';
+      failures.push(`Context for ${region} returned ${probe.status} ${probe.statusText};${landing} final URL ${chain.finalUrl}`);
+    } catch (error) {
+      failures.push(`${link} failed: ${error instanceof Error ? error.message : String(error)}`);
     }
   }
 
-  if (!currentUrl.includes('uczen.eduvulcan.pl')) {
-    throw new CliError(`Failed to reach the student portal. Current URL: ${currentUrl}`, EXIT_CODES.LOGIN_OR_NAVIGATION);
-  }
-
-  const match = currentUrl.match(/https:\/\/uczen\.eduvulcan\.pl\/([^/]+)/);
-  if (!match) {
-    throw new CliError(`Could not determine EduVulcan region from URL: ${currentUrl}`, EXIT_CODES.LOGIN_OR_NAVIGATION);
-  }
-
-  return match[1];
+  throw new CliError(
+    `Student portal handoff did not reach Context. ${failures.join(' | ')}`,
+    EXIT_CODES.API_FETCH,
+  );
 }
 
 async function fetchRecentMessages(
-  page: Page,
+  client: HttpClient,
   region: string,
-  headers: Record<string, string>,
   warnings: string[],
 ): Promise<EduMessageListItem[]> {
   const messagesApiBase = `https://wiadomosci.eduvulcan.pl/${region}/api`;
-  let allMessages: EduMessageListItem[] = [];
 
   try {
-    await clickFirstAvailable(page, [
-      'a[href*="wiadomosci"]',
-      'text=Wiadomości',
-      'button:has-text("Wiadomości")',
-    ], 5_000);
-    await page.waitForLoadState('networkidle');
-    await sleep(2_000);
-
-    const payload = await safeApiJson<EduMessageListItem[]>(
-      page,
-      `${messagesApiBase}/Odebrane?idLastWiadomosc=0&pageSize=50`,
-      headers,
-      warnings,
-      'Messages list',
-    );
-    allMessages = Array.isArray(payload) ? payload : [];
+    const chain = await completeWsFedChain(client, `https://wiadomosci.eduvulcan.pl/${region}/App`);
+    if (chain.notFound) {
+      warnings.push(`Messages inbox landing page was not found (${chain.status} ${chain.finalUrl}).`);
+    }
   } catch (error) {
-    warnings.push(`Messages fetch bootstrap failed: ${error instanceof Error ? error.message : String(error)}`);
+    warnings.push(`Messages inbox SSO failed: ${error instanceof Error ? error.message : String(error)}`);
+    return [];
   }
 
-  return allMessages;
+  const payload = await safeApiJson<EduMessageListItem[]>(
+    withHeaders(client, messagesApiHeaders(region)),
+    `${messagesApiBase}/Odebrane?idLastWiadomosc=0&pageSize=50`,
+    warnings,
+    'Messages list',
+  );
+  return Array.isArray(payload) ? payload : [];
 }
 
 async function fetchStudentRecords(options: {
-  page: Page;
+  client: HttpClient;
   region: string;
   targetDate: string;
   timezone: string;
   profile: FetchProfile;
   warnings: string[];
 }): Promise<NormalizedStudentRecord[]> {
-  const { page, region, targetDate, timezone, profile, warnings } = options;
+  const { client: rawClient, region, targetDate, timezone, profile, warnings } = options;
+  const client = withHeaders(rawClient, diaryApiHeaders(region));
   const apiBase = `https://uczen.eduvulcan.pl/${region}/api`;
   const { from, to } = buildDateRange(targetDate, timezone);
   const encodedFrom = encodeURIComponent(from);
   const encodedTo = encodeURIComponent(to);
 
-  const headers = {
-    Accept: 'application/json',
-  };
-
-  const contextData = await apiGetJson<ContextResponse>(page, `${apiBase}/Context`, headers, EXIT_CODES.API_FETCH);
+  const contextData = await apiGetJson<ContextResponse>(client, `${apiBase}/Context`, EXIT_CODES.API_FETCH);
   const students = contextData.uczniowie.filter((student) => student.aktywny);
 
   const records: NormalizedStudentRecord[] = [];
 
   for (const student of students) {
     const schedulePromise = safeApiJson<EduScheduleItem[]>(
-      page,
+      client,
       `${apiBase}/PlanZajec?key=${student.key}&dataOd=${encodedFrom}&dataDo=${encodedTo}&zakresDanych=2`,
-      headers,
       warnings,
       `Schedule for ${student.uczen}`,
     );
     const homeworkListPromise = safeApiJson<EduHomeworkListItem[]>(
-      page,
+      client,
       `${apiBase}/SprawdzianyZadaniaDomowe?key=${student.key}&dataOd=${encodedFrom}&dataDo=${encodedTo}`,
-      headers,
       warnings,
       `Homework list for ${student.uczen}`,
     );
     const freeDaysPromise = safeApiJson<Record<string, unknown>[]>(
-      page,
+      client,
       `${apiBase}/DniWolne?key=${student.key}&dataOd=${encodedFrom}&dataDo=${encodedTo}`,
-      headers,
       warnings,
       `Free days for ${student.uczen}`,
     );
 
     const gradesPromise = profile === 'comprehensive'
-      ? safeApiJson<EduGradeItem[]>(page, `${apiBase}/OcenyTablica?key=${student.key}`, headers, warnings, `Grades for ${student.uczen}`)
+      ? safeApiJson<EduGradeItem[]>(client, `${apiBase}/OcenyTablica?key=${student.key}`, warnings, `Grades for ${student.uczen}`)
       : Promise.resolve(undefined);
     const announcementsPromise = profile === 'comprehensive'
-      ? safeApiJson<Record<string, unknown>[]>(page, `${apiBase}/OgloszeniaTablica?key=${student.key}`, headers, warnings, `Announcements for ${student.uczen}`)
+      ? safeApiJson<Record<string, unknown>[]>(client, `${apiBase}/OgloszeniaTablica?key=${student.key}`, warnings, `Announcements for ${student.uczen}`)
       : Promise.resolve(undefined);
     const infoCardsPromise = profile === 'comprehensive'
-      ? safeApiJson<Record<string, unknown>[]>(page, `${apiBase}/InformacjeTablica?key=${student.key}`, headers, warnings, `Info cards for ${student.uczen}`)
+      ? safeApiJson<Record<string, unknown>[]>(client, `${apiBase}/InformacjeTablica?key=${student.key}`, warnings, `Info cards for ${student.uczen}`)
       : Promise.resolve(undefined);
 
     const [rawSchedule, homeworkList, rawFreeDays, rawGrades, rawAnnouncements, rawInfoCards] = await Promise.all([
@@ -390,10 +498,9 @@ async function fetchStudentRecords(options: {
     const homework: NormalizedHomeworkItem[] = [];
     for (const item of Array.isArray(homeworkList) ? homeworkList : []) {
       try {
-        const detailResponse = await fetchJsonInPage<EduHomeworkDetail>(
-          page,
+        const detailResponse = await readJson<EduHomeworkDetail>(
+          client,
           `${apiBase}/ZadanieDomoweSzczegoly?key=${student.key}&id=${item.id}`,
-          headers,
         );
         const detail = detailResponse.ok ? detailResponse.data : undefined;
         if (!detailResponse.ok) {
@@ -441,7 +548,8 @@ async function fetchStudentRecords(options: {
     });
   }
 
-  const allMessages = await fetchRecentMessages(page, region, headers, warnings);
+  const allMessages = await fetchRecentMessages(rawClient, region, warnings);
+  const messagesClient = withHeaders(rawClient, messagesApiHeaders(region));
   const messagesApiBase = `https://wiadomosci.eduvulcan.pl/${region}/api`;
 
   for (const record of records) {
@@ -450,10 +558,9 @@ async function fetchStudentRecords(options: {
 
     for (const message of mappedMessages) {
       try {
-        const detailResponse = await fetchJsonInPage<EduMessageDetail>(
-          page,
+        const detailResponse = await readJson<EduMessageDetail>(
+          messagesClient,
           `${messagesApiBase}/WiadomoscSzczegoly?apiGlobalKey=${message.apiGlobalKey}`,
-          headers,
         );
         const detail = detailResponse.ok ? detailResponse.data : undefined;
         if (!detailResponse.ok) {
@@ -504,9 +611,9 @@ export async function fetchSnapshot(options: {
   const { browser, context, page } = await launchBrowser(options.headless);
 
   try {
-    const region = await loginAndGetRegion(page, options.username, options.password);
+    const { region, client } = await establishPortalSession(page, context.request, options.username, options.password);
     const students = await fetchStudentRecords({
-      page,
+      client,
       region,
       targetDate,
       timezone,
